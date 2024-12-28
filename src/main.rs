@@ -1,9 +1,11 @@
 #[macro_use]
 extern crate chainsaw;
 
+use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::BufRead;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::{collections::HashSet, io::BufReader};
 
 use anyhow::{Context, Result};
@@ -11,11 +13,12 @@ use bytesize::ByteSize;
 use chrono::NaiveDateTime;
 use chrono_tz::Tz;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 use chainsaw::{
     cli, get_files, lint as lint_rule, load as load_rule, set_writer, Document, Filter, Format,
-    Hunter, Reader, RuleKind, RuleLevel, RuleStatus, Searcher, ShimcacheAnalyzer, Writer,
+    Hunter, Reader, RuleKind, RuleLevel, RuleStatus, Searcher, ShimcacheAnalyser, SrumAnalyser,
+    Writer,
 };
 
 #[derive(Parser)]
@@ -45,16 +48,19 @@ struct Args {
     /// Limit the thread number (default: num of CPUs)
     #[arg(long)]
     num_threads: Option<usize>,
+    /// Print verbose output.
+    #[arg(short = 'v', action = ArgAction::Count)]
+    verbose: u8,
     #[command(subcommand)]
     cmd: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Dump an artefact into a different format.
+    /// Dump artefacts into a different format.
     Dump {
-        /// The path to an artefact to dump.
-        path: PathBuf,
+        /// The paths containing files to dump.
+        path: Vec<PathBuf>,
 
         /// Dump in json format.
         #[arg(group = "format", short = 'j', long = "json")]
@@ -65,15 +71,26 @@ enum Command {
         /// Allow chainsaw to try and load files it cannot identify.
         #[arg(long = "load-unknown")]
         load_unknown: bool,
+        /// Only dump files with the provided extension.
+        #[arg(long = "extension")]
+        extension: Option<String>,
         /// A path to output results to.
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
-        /// Supress informational output.
+        /// Suppress informational output.
         #[arg(short = 'q')]
         quiet: bool,
         /// Continue to hunt when an error is encountered.
         #[arg(long = "skip-errors")]
         skip_errors: bool,
+
+        // MFT Specific Options
+        /// Attempt to decode all extracted data streams from Hex to UTF-8
+        #[arg(long = "decode-data-streams", help_heading = "MFT Specific Options")]
+        decode_data_streams: bool,
+        /// Extracted data streams will be decoded and written to this directory
+        #[arg(long = "data-streams-directory", help_heading = "MFT Specific Options")]
+        data_streams_directory: Option<PathBuf>,
     },
 
     /// Hunt through artefacts using detection rules for threat detection.
@@ -145,7 +162,7 @@ enum Command {
         /// (BETA) Enable preprocessing, which can result in increased performance.
         #[arg(long = "preprocess")]
         preprocess: bool,
-        /// Supress informational output.
+        /// Suppress informational output.
         #[arg(short = 'q')]
         quiet: bool,
         /// A path containing Sigma rules to hunt with.
@@ -183,7 +200,7 @@ enum Command {
         tau: bool,
     },
 
-    /// Search through forensic artefacts for keywords.
+    /// Search through forensic artefacts for keywords or patterns.
     Search {
         /// A string or regular expression pattern to search for.
         /// Not used when -e or -t is specified.
@@ -224,16 +241,20 @@ enum Command {
         /// Output the timestamp using the local machine's timestamp.
         #[arg(long = "local", group = "tz")]
         local: bool,
+        /// Require any of the provided patterns to be found to constitute a match.
+        #[arg(long = "match-any")]
+        match_any: bool,
         /// The path to output results to.
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
-        /// Supress informational output.
+        /// Suppress informational output.
         #[arg(short = 'q')]
         quiet: bool,
         /// Continue to search when an error is encountered.
         #[arg(long = "skip-errors")]
         skip_errors: bool,
-        /// Tau expressions to search with. e.g. 'Event.System.EventID: =4104'
+        /// Tau expressions to search with. e.g. 'Event.System.EventID: =4104'.
+        /// Multiple conditions are logical ANDs unless the 'match-any' flag is specified
         #[arg(short = 't', long = "tau", number_of_values = 1)]
         tau: Option<Vec<String>>,
         /// The field that contains the timestamp.
@@ -248,7 +269,7 @@ enum Command {
         to: Option<NaiveDateTime>,
     },
 
-    /// Perform various analyses on artifacts
+    /// Perform various analyses on artefacts
     Analyse {
         #[command(subcommand)]
         cmd: AnalyseCommand,
@@ -259,7 +280,7 @@ enum Command {
 enum AnalyseCommand {
     /// Create an execution timeline from the shimcache with optional amcache enrichments
     Shimcache {
-        /// The path to the shimcache artifact (SYSTEM registry file)
+        /// The path to the shimcache artefact (SYSTEM registry file)
         shimcache: PathBuf,
         /// A string or regular expression for detecting shimcache entries whose timestamp matches their insertion time
         #[arg(
@@ -275,12 +296,29 @@ enum AnalyseCommand {
         /// The path to output the result csv file
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
-        /// The path to the amcache artifact (Amcache.hve) for timeline enrichment
+        /// The path to the amcache artefact (Amcache.hve) for timeline enrichment
         #[arg(short = 'a', long = "amcache")]
         amcache: Option<PathBuf>,
         /// Enable near timestamp pair detection between shimcache and amcache for finding additional insertion timestamps for shimcache entries
         #[arg(short = 'p', long = "tspair", requires = "amcache")]
         ts_near_pair_matching: bool,
+    },
+    /// Analyse the SRUM database
+    Srum {
+        /// The path to the SRUM database
+        srum_path: PathBuf,
+        /// The path to the SOFTWARE hive
+        #[arg(short = 's', long = "software")]
+        software_hive_path: PathBuf,
+        /// Only output details about the SRUM database
+        #[arg(long = "stats-only")]
+        stats_only: bool,
+        /// Suppress informational output.
+        #[arg(short = 'q')]
+        quiet: bool,
+        /// Save the output to a file
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -293,7 +331,7 @@ fn print_title() {
 ██║     ██╔══██║██╔══██║██║██║╚██╗██║╚════██║██╔══██║██║███╗██║
 ╚██████╗██║  ██║██║  ██║██║██║ ╚████║███████║██║  ██║╚███╔███╔╝
  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
-    By Countercept (@FranticTyping, @AlexKornitzer)
+    By WithSecure Countercept (@FranticTyping, @AlexKornitzer)
 "
     );
 }
@@ -315,7 +353,13 @@ fn resolve_col_width() -> Option<u32> {
     }
 }
 
-fn init_writer(output: Option<PathBuf>, csv: bool, json: bool, quiet: bool) -> crate::Result<()> {
+fn init_writer(
+    output: Option<PathBuf>,
+    csv: bool,
+    json: bool,
+    quiet: bool,
+    verbose: u8,
+) -> crate::Result<()> {
     let (path, output) = match &output {
         Some(path) => {
             if csv {
@@ -348,6 +392,7 @@ fn init_writer(output: Option<PathBuf>, csv: bool, json: bool, quiet: bool) -> c
         output,
         path,
         quiet,
+        verbose,
     };
     set_writer(writer).expect("could not set writer");
     Ok(())
@@ -367,58 +412,102 @@ fn run() -> Result<()> {
             json,
             jsonl,
             load_unknown,
+            extension,
             output,
             quiet,
             skip_errors,
+            decode_data_streams,
+            data_streams_directory,
         } => {
-            init_writer(output, false, json, quiet)?;
+            init_writer(output, false, json, quiet, args.verbose)?;
             if !args.no_banner {
                 print_title();
             }
-            let mut reader = Reader::load(&path, load_unknown, skip_errors)?;
             cs_eprintln!(
-                "[+] Dumping the contents of forensic artefact - {}...",
-                path.display()
+                "[+] Dumping the contents of forensic artefacts from: {} (extensions: {})",
+                path.iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                extension.clone().unwrap_or("*".to_string())
             );
+
             if json {
                 cs_print!("[");
             }
+
+            let mut files = vec![];
+            let mut size = ByteSize::mb(0);
+            let mut extensions: Option<HashSet<String>> = None;
+            if let Some(extension) = extension {
+                extensions = Some(HashSet::from([extension]));
+            }
+            for path in &path {
+                let res = get_files(path, &extensions, skip_errors)?;
+                for i in &res {
+                    size += i.metadata()?.len();
+                }
+                files.extend(res);
+            }
+            if files.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "No compatible files were found in the provided paths",
+                ));
+            } else {
+                cs_eprintln!("[+] Loaded {} forensic artefacts ({})", files.len(), size);
+            }
+
             let mut first = true;
-            for result in reader.documents() {
-                let document = match result {
-                    Ok(document) => document,
-                    Err(e) => {
-                        if skip_errors {
-                            cs_eyellowln!(
-                                "[!] failed to parse document '{}' - {}\n",
-                                path.display(),
-                                e
-                            );
-                            continue;
+            for path in &files {
+                let mut reader = Reader::load(
+                    path,
+                    load_unknown,
+                    skip_errors,
+                    decode_data_streams,
+                    data_streams_directory.clone(),
+                )?;
+
+                // We try to keep the reader and parser as generic as possible.
+                // However in some cases we need to pass artefact specific arguments to the parser.
+                // If the argument is not relevant for the artefact, it is ignored.
+                for result in reader.documents() {
+                    let document = match result {
+                        Ok(document) => document,
+                        Err(e) => {
+                            if skip_errors {
+                                cs_eyellowln!(
+                                    "[!] failed to parse document '{}' - {}\n",
+                                    path.display(),
+                                    e
+                                );
+                                continue;
+                            }
+                            return Err(e);
                         }
-                        return Err(e);
-                    }
-                };
-                let value = match document {
-                    Document::Evtx(evtx) => evtx.data,
-                    Document::Hve(json)
-                    | Document::Json(json)
-                    | Document::Xml(json)
-                    | Document::Mft(json) => json,
-                };
-                if json {
-                    if first {
-                        first = false;
+                    };
+                    let value = match document {
+                        Document::Evtx(evtx) => evtx.data,
+                        Document::Hve(json)
+                        | Document::Json(json)
+                        | Document::Xml(json)
+                        | Document::Mft(json)
+                        | Document::Esedb(json) => json,
+                    };
+
+                    if json {
+                        if first {
+                            first = false;
+                        } else {
+                            cs_println!(",");
+                        }
+                        cs_print_json_pretty!(&value)?;
+                    } else if jsonl {
+                        cs_print_json!(&value)?;
+                        cs_println!();
                     } else {
-                        cs_println!(",");
+                        cs_println!("---");
+                        cs_print_yaml!(&value)?;
                     }
-                    cs_print_json_pretty!(&value)?;
-                } else if jsonl {
-                    cs_print_json!(&value)?;
-                    cs_println!();
-                } else {
-                    cs_println!("---");
-                    cs_print_yaml!(&value)?;
                 }
             }
             if json {
@@ -475,7 +564,7 @@ fn run() -> Result<()> {
                     }
                 }
             }
-            init_writer(output.clone(), csv, json, quiet)?;
+            init_writer(output.clone(), csv, json, quiet, args.verbose)?;
             if !args.no_banner {
                 print_title();
             }
@@ -524,6 +613,7 @@ fn run() -> Result<()> {
             let mut rs = vec![];
             for path in &rules {
                 for file in get_files(path, &None, skip_errors)? {
+                    cs_debug!("[*] Loading chainsaw rule - {}", file.display());
                     match load_rule(RuleKind::Chainsaw, &file, &kinds, &levels, &statuses) {
                         Ok(r) => {
                             if !r.is_empty() {
@@ -539,6 +629,7 @@ fn run() -> Result<()> {
             }
             for path in &sigma {
                 for file in get_files(path, &None, skip_errors)? {
+                    cs_debug!("[*] Loading sigma rule - {}", file.display());
                     match load_rule(RuleKind::Sigma, &file, &kinds, &levels, &statuses) {
                         Ok(r) => {
                             if !r.is_empty() {
@@ -651,9 +742,15 @@ fn run() -> Result<()> {
             let mut hits = 0;
             let mut documents = 0;
             let mut detections = vec![];
-            let pb = cli::init_progress_bar(files.len() as u64, "Hunting".to_string());
+            let pb = cli::init_progress_bar(
+                files.len() as u64,
+                "".to_string(),
+                args.verbose != 0,
+                "Hunting".to_string(),
+            );
             for file in &files {
-                pb.tick();
+                cs_debug!("[*] Hunting through file - {}", file.display());
+                pb.set_message(format!("[+] Current Artifact: {}\n", file.display()));
                 let cache = if cache {
                     match tempfile::tempfile() {
                         Ok(f) => Some(f),
@@ -665,7 +762,7 @@ fn run() -> Result<()> {
                     None
                 };
                 let scratch = hunter.hunt(file, &cache).with_context(|| {
-                    format!("Failed to hunt through file '{}'", file.to_string_lossy())
+                    format!("Failed to hunt through file '{}' (Use --skip-errors to continue processing)", file.to_string_lossy())
                 })?;
                 hits += scratch.iter().map(|d| d.hits.len()).sum::<usize>();
                 documents += scratch.len();
@@ -710,7 +807,7 @@ fn run() -> Result<()> {
             cs_eprintln!("\n[+] {} Detections found on {} documents", hits, documents,);
         }
         Command::Lint { path, kind, tau } => {
-            init_writer(None, false, false, false)?;
+            init_writer(None, false, false, false, args.verbose)?;
             if !args.no_banner {
                 print_title();
             }
@@ -782,6 +879,7 @@ fn run() -> Result<()> {
             jsonl,
             load_unknown,
             local,
+            match_any,
             output,
             quiet,
             skip_errors,
@@ -790,7 +888,7 @@ fn run() -> Result<()> {
             timezone,
             to,
         } => {
-            init_writer(output, false, json, quiet)?;
+            init_writer(output, false, json, quiet, args.verbose)?;
             if !args.no_banner {
                 print_title();
             }
@@ -855,7 +953,8 @@ fn run() -> Result<()> {
                 .ignore_case(ignore_case)
                 .load_unknown(load_unknown)
                 .local(local)
-                .skip_errors(skip_errors);
+                .skip_errors(skip_errors)
+                .match_any(match_any);
             if let Some(patterns) = additional_pattern {
                 searcher = searcher.patterns(patterns);
             } else if let Some(pattern) = pattern {
@@ -881,37 +980,62 @@ fn run() -> Result<()> {
             if json {
                 cs_print!("[");
             }
-            let mut hits = 0;
-            for file in &files {
-                for res in searcher.search(file)?.iter() {
-                    let hit = match res {
-                        Ok(hit) => hit,
-                        Err(e) => {
-                            if skip_errors {
-                                continue;
+
+            let total_hits = Arc::new(std::sync::Mutex::new(0));
+
+            files.par_iter().try_for_each(|file| {
+                match searcher.search(file) {
+                    Ok(mut results) => {
+                        for res in results.iter() {
+                            let hit = match res {
+                                Ok(hit) => hit,
+                                Err(e) => {
+                                    return Err(anyhow::anyhow!(
+                                        "Failed to search file {} - {} (Use --skip-errors to continue processing)",
+                                        file.display(),
+                                        e
+                                    ));
+                                }
+                            };
+
+                            // Create lock before dealing with JSON print sequence
+                            let mut hit_count = total_hits.lock().expect("Failed to lock total_hits mutex");
+
+                            if json {
+                                if *hit_count != 0 {
+                                    cs_print!(",");
+                                }
+                                cs_print_json!(&hit)?;
+                            } else if jsonl {
+                                cs_print_json!(&hit)?;
+                                cs_println!();
+                            } else {
+                                cs_println!("---");
+                                cs_print_yaml!(&hit)?;
                             }
-                            anyhow::bail!("Failed to search file... - {}", e);
+                            *hit_count += 1;
                         }
-                    };
-                    if json {
-                        if hits != 0 {
-                            cs_print!(",");
-                        }
-                        cs_print_json!(&hit)?;
-                    } else if jsonl {
-                        cs_print_json!(&hit)?;
-                        cs_println!();
-                    } else {
-                        cs_println!("---");
-                        cs_print_yaml!(&hit)?;
                     }
-                    hits += 1;
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to search file {} - {} (Use --skip-errors to continue processing)",
+                            file.display(),
+                            e
+                        ));
+                    }
                 }
-            }
+
+
+                Ok(())
+            })?;
+
             if json {
                 cs_println!("]");
             }
-            cs_eprintln!("[+] Found {} hits", hits);
+            cs_eprintln!(
+                "[+] Found {} hits",
+                *total_hits.lock().expect("Failed to lock total_hits mutex")
+            );
         }
         Command::Analyse { cmd } => {
             match cmd {
@@ -926,8 +1050,8 @@ fn run() -> Result<()> {
                     if !args.no_banner {
                         print_title();
                     }
-                    init_writer(output.clone(), true, false, false)?;
-                    let shimcache_analyzer = ShimcacheAnalyzer::new(shimcache, amcache);
+                    init_writer(output.clone(), true, false, false, args.verbose)?;
+                    let shimcache_analyser = ShimcacheAnalyser::new(shimcache, amcache);
 
                     // Load regex
                     let mut regex_patterns: Vec<String> = Vec::new();
@@ -938,7 +1062,7 @@ fn run() -> Result<()> {
                         cs_eprintln!(
                             "[+] Regex file with {} pattern(s) loaded from {:?}",
                             file_regex_patterns.len(),
-                            fs::canonicalize(&regex_file).expect("cloud not get absolute path")
+                            fs::canonicalize(&regex_file).expect("could not get absolute path")
                         );
                         regex_patterns.append(&mut file_regex_patterns);
                     }
@@ -947,7 +1071,7 @@ fn run() -> Result<()> {
                     }
 
                     // Do analysis
-                    let timeline = shimcache_analyzer
+                    let timeline = shimcache_analyser
                         .amcache_shimcache_timeline(&regex_patterns, ts_near_pair_matching)?;
                     cli::print_shimcache_analysis_csv(&timeline)?;
 
@@ -957,6 +1081,59 @@ fn run() -> Result<()> {
                             std::fs::canonicalize(output_path)
                                 .expect("could not get absolute path")
                         );
+                    }
+                }
+                AnalyseCommand::Srum {
+                    srum_path,
+                    software_hive_path,
+                    stats_only,
+                    quiet,
+                    output,
+                } => {
+                    init_writer(output.clone(), false, true, quiet, args.verbose)?;
+                    if !args.no_banner {
+                        print_title();
+                    }
+                    let srum_analyser = SrumAnalyser::new(srum_path, software_hive_path);
+                    match srum_analyser.parse_srum_database() {
+                        Ok(srum_db_info) => {
+                            if stats_only {
+                                cs_eprintln!(
+                                    "[+] Details about the tables related to the SRUM extensions:"
+                                );
+                                cs_println!(
+                                    "{}",
+                                    srum_db_info
+                                        .table_details
+                                        .to_string()
+                                        .trim_end_matches('\n')
+                                );
+                            } else {
+                                cs_eprintln!(
+                                    "[+] Details about the tables related to the SRUM extensions:\n{}",
+                                    srum_db_info.table_details.to_string().trim_end_matches('\n')
+                                );
+
+                                let json = srum_db_info.db_content;
+                                cs_eprintln!("[+] SRUM database parsed successfully");
+                                if let Some(output_path) = output {
+                                    cs_eprintln!(
+                                        "[+] Saving output to {:?}",
+                                        std::fs::canonicalize(&output_path)
+                                            .expect("could not get absolute path")
+                                    );
+                                    cs_print_json!(&json)?;
+                                    cs_eprintln!(
+                                        "[+] Saved output to {:?}",
+                                        std::fs::canonicalize(&output_path)
+                                            .expect("could not get absolute path")
+                                    );
+                                } else {
+                                    cs_print_json!(&json)?;
+                                }
+                            }
+                        }
+                        Err(err) => cs_eredln!("[!] Error parsing SRUM database: {:?}", err),
                     }
                 }
             }

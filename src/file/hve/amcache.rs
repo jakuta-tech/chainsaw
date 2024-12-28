@@ -1,8 +1,8 @@
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use notatin::cell_key_node::CellKeyNode;
 use serde::Serialize;
 
-use crate::file::hve::win32_ts_to_datetime;
+use crate::file::win32_ts_to_datetime;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
@@ -28,14 +28,13 @@ pub struct ProgramEntry {
 }
 
 #[derive(Debug)]
-pub struct AmcacheArtifact {
-    pub is_new_format: bool,
+pub struct AmcacheArtefact {
     pub file_entries: Vec<FileEntry>,
     pub program_entries: Vec<ProgramEntry>,
 }
 
 impl super::Parser {
-    pub fn parse_amcache(&mut self) -> crate::Result<AmcacheArtifact> {
+    pub fn parse_amcache(&mut self) -> crate::Result<AmcacheArtefact> {
         /// A helper function for getting string values from registry keys
         fn string_value_from_key(
             key: &CellKeyNode,
@@ -66,7 +65,7 @@ impl super::Parser {
             /// A helper function for converting registry timestamp strings to DateTime
             fn win_reg_str_ts_to_date_time(ts_str: &str) -> crate::Result<DateTime<Utc>> {
                 let naive = NaiveDateTime::parse_from_str(ts_str, "%m/%d/%Y %H:%M:%S")?;
-                Ok(DateTime::<Utc>::from_utc(naive, Utc))
+                Ok(Utc.from_utc_datetime(&naive))
             }
 
             // Get and parse data from InventoryApplication
@@ -80,17 +79,12 @@ impl super::Parser {
                 let program_id = key.key_name.clone();
                 let program_name = string_value_from_key(&key, "Name")?
                     .ok_or(anyhow!("Could not get Name for program {}", key.key_name))?;
-                let install_date = string_value_from_key(&key, "InstallDate")?.ok_or(anyhow!(
-                    "Could not get InstallDate for program {}",
-                    program_id
-                ))?;
                 let version = string_value_from_key(&key, "Version")?
                     .ok_or(anyhow!("Could not get Version for program {}", program_id))?;
 
-                let install_date = if !install_date.is_empty() {
-                    Some(win_reg_str_ts_to_date_time(install_date.as_str())?)
-                } else {
-                    None
+                let install_date = match string_value_from_key(&key, "InstallDate")?.as_deref() {
+                    Some("") | None => None,
+                    Some(v) => Some(win_reg_str_ts_to_date_time(v)?),
                 };
 
                 let root_directory_path = string_value_from_key(&key, "RootDirPath")?;
@@ -126,22 +120,23 @@ impl super::Parser {
                 let link_date_str = string_value_from_key(&key, "LinkDate")?
                     .ok_or(anyhow!("Could not get LinkDate for file {}", key.key_name))?;
                 let link_date = if !link_date_str.is_empty() {
-                    Some(win_reg_str_ts_to_date_time(link_date_str.as_str())?)
+                    // NOTE: Sometimes the link date is just completely invalid, in that case we
+                    // just none it rather than throwing an error. We should log this out, but for
+                    // now this is sufficient.
+                    win_reg_str_ts_to_date_time(link_date_str.as_str()).ok()
                 } else {
                     None
                 };
 
                 // FileId is the SHA-1 hash of the file with "0000" prepended. Discard prefix
-                let sha1_hash = file_id
-                    .as_ref()
-                    .and_then(|id| {
-                        if id.len() == 44 && &id[..4] == "0000" {
-                            Some(String::from(&id[4..]))
-                        } else {
-                            // In case unexpected value
-                            None
-                        }
-                    });
+                let sha1_hash = file_id.as_ref().and_then(|id| {
+                    if id.len() == 44 && &id[..4] == "0000" {
+                        Some(String::from(&id[4..]))
+                    } else {
+                        // In case unexpected value
+                        None
+                    }
+                });
 
                 let key_last_modified_ts = key.last_key_written_date_and_time();
                 let file_entry = FileEntry {
@@ -170,17 +165,17 @@ impl super::Parser {
                         if num == 0 {
                             return Ok(None);
                         }
-                        let naive = NaiveDateTime::from_timestamp_opt(num as i64, 0)
+                        let datetime = DateTime::from_timestamp(num as i64, 0)
                             .expect("unix timestamp our of range");
-                        Some(DateTime::<Utc>::from_utc(naive, Utc))
+                        Some(datetime)
                     }
                     notatin::cell_value::CellValue::U64(num) => {
                         if num == 0 {
                             return Ok(None);
                         }
-                        let naive = NaiveDateTime::from_timestamp_opt(num as i64, 0)
+                        let datetime = DateTime::from_timestamp(num as i64, 0)
                             .expect("unix timestamp our of range");
-                        Some(DateTime::<Utc>::from_utc(naive, Utc))
+                        Some(datetime)
                     }
                     _ => bail!(
                         "Value \"{}\" in key \"{}\" was not of type U32 or U64!",
@@ -243,8 +238,8 @@ impl super::Parser {
                         if let (notatin::cell_value::CellValue::U64(ts), _logs) =
                             value.get_content()
                         {
-                            let naive = win32_ts_to_datetime(ts)?;
-                            Some(DateTime::<Utc>::from_utc(naive, Utc))
+                            let datetime = win32_ts_to_datetime(ts)?;
+                            Some(datetime)
                         } else {
                             None
                         }
@@ -253,16 +248,14 @@ impl super::Parser {
                     };
 
                     // FileId is the SHA-1 hash of the file with "0000" prepended. Discard prefix
-                    let sha1_hash = file_id
-                        .as_ref()
-                        .and_then(|id| {
-                            if id.len() == 44 && &id[..4] == "0000" {
-                                Some(String::from(&id[4..]))
-                            } else {
-                                // In case unexpected value
-                                None
-                            }
-                        });
+                    let sha1_hash = file_id.as_ref().and_then(|id| {
+                        if id.len() == 44 && &id[..4] == "0000" {
+                            Some(String::from(&id[4..]))
+                        } else {
+                            // In case unexpected value
+                            None
+                        }
+                    });
 
                     let key_last_modified_ts = key_file.last_key_written_date_and_time();
                     let file_entry = FileEntry {
@@ -279,10 +272,9 @@ impl super::Parser {
             }
         }
 
-        Ok(AmcacheArtifact {
+        Ok(AmcacheArtefact {
             file_entries,
             program_entries,
-            is_new_format,
         })
     }
 }

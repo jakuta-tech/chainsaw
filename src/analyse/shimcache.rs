@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 
 use crate::file::hve::{
-    amcache::{AmcacheArtifact, FileEntry, ProgramEntry},
+    amcache::{AmcacheArtefact, FileEntry, ProgramEntry},
     shimcache::{EntryType, ShimcacheEntry},
     Parser as HveParser,
 };
@@ -47,12 +47,12 @@ impl TimelineEntity {
     }
 }
 
-pub struct ShimcacheAnalyzer {
+pub struct ShimcacheAnalyser {
     amcache_path: Option<PathBuf>,
     shimcache_path: PathBuf,
 }
 
-impl ShimcacheAnalyzer {
+impl ShimcacheAnalyser {
     pub fn new(shimcache_path: PathBuf, amcache_path: Option<PathBuf>) -> Self {
         Self {
             amcache_path,
@@ -62,7 +62,7 @@ impl ShimcacheAnalyzer {
 
     pub fn amcache_shimcache_timeline(
         &self,
-        regex_patterns: &Vec<String>,
+        regex_patterns: &[String],
         ts_near_pair_matching: bool,
     ) -> crate::Result<Vec<TimelineEntity>> {
         if regex_patterns.is_empty() {
@@ -83,7 +83,7 @@ impl ShimcacheAnalyzer {
         );
 
         // Load amcache
-        let amcache: Option<AmcacheArtifact> = if let Some(amcache_path) = &self.amcache_path {
+        let amcache: Option<AmcacheArtefact> = if let Some(amcache_path) = &self.amcache_path {
             let mut amcache_parser = HveParser::load(amcache_path)?;
             cs_eprintln!(
                 "[+] Amcache hive file loaded from {:?}",
@@ -113,10 +113,7 @@ impl ShimcacheAnalyzer {
         }
 
         /// Sets timestamp ranges for timeline entities based on shimcache entry order and indices
-        fn set_timestamp_ranges(
-            range_indices: &[usize],
-            timeline_entities: &mut Vec<TimelineEntity>,
-        ) {
+        fn set_timestamp_ranges(range_indices: &[usize], timeline_entities: &mut [TimelineEntity]) {
             let first_index = if let Some(index) = range_indices.first() {
                 *index
             } else {

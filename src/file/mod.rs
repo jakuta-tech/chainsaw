@@ -2,14 +2,19 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use chrono::{DateTime, Utc};
+
+use self::esedb::{Esedb, Parser as EsedbParser};
 use self::evtx::{Evtx, Parser as EvtxParser};
 use self::hve::{Hve, Parser as HveParser};
 use self::json::{lines::Parser as JsonlParser, Json, Parser as JsonParser};
 use self::mft::{Mft, Parser as MftParser};
 use self::xml::{Parser as XmlParser, Xml};
 
+pub mod esedb;
 pub mod evtx;
 pub mod hve;
 pub mod json;
@@ -23,6 +28,7 @@ pub enum Document {
     Json(Json),
     Mft(Mft),
     Xml(Xml),
+    Esedb(Esedb),
 }
 
 pub struct Documents<'a> {
@@ -38,6 +44,7 @@ pub enum Kind {
     Jsonl,
     Mft,
     Xml,
+    Esedb,
     Unknown,
 }
 
@@ -48,14 +55,19 @@ impl Kind {
             Kind::Hve => Some(vec!["hve".to_string()]),
             Kind::Json => Some(vec!["json".to_string()]),
             Kind::Jsonl => Some(vec!["jsonl".to_string()]),
-            Kind::Mft => Some(vec!["mft".to_string(), "bin".to_string()]),
+            Kind::Mft => Some(vec![
+                "mft".to_string(),
+                "bin".to_string(),
+                "$MFT".to_string(),
+            ]),
             Kind::Xml => Some(vec!["xml".to_string()]),
+            Kind::Esedb => Some(vec!["dat".to_string(), "edb".to_string()]),
             Kind::Unknown => None,
         }
     }
 }
 
-impl<'a> Iterator for Documents<'a> {
+impl Iterator for Documents<'_> {
     type Item = crate::Result<Document>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -72,6 +84,7 @@ impl Iterator for Unknown {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Parser {
     Evtx(EvtxParser),
     Hve(HveParser),
@@ -79,6 +92,7 @@ pub enum Parser {
     Jsonl(JsonlParser),
     Mft(MftParser),
     Xml(XmlParser),
+    Esedb(EsedbParser),
     Unknown,
 }
 
@@ -87,7 +101,13 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn load(file: &Path, load_unknown: bool, skip_errors: bool) -> crate::Result<Self> {
+    pub fn load(
+        file: &Path,
+        load_unknown: bool,
+        skip_errors: bool,
+        decode_data_streams: bool,
+        data_streams_directory: Option<PathBuf>,
+    ) -> crate::Result<Self> {
         // NOTE: We don't want to use libmagic because then we have to include databases etc... So
         // for now we assume that the file extensions are correct!
         match file.extension().and_then(|e| e.to_str()) {
@@ -159,7 +179,11 @@ impl Reader {
                     })
                 }
                 "bin" | "mft" => {
-                    let parser = match MftParser::load(file) {
+                    let parser = match MftParser::load(
+                        file,
+                        data_streams_directory.clone(),
+                        decode_data_streams,
+                    ) {
                         Ok(parser) => parser,
                         Err(e) => {
                             if skip_errors {
@@ -224,13 +248,39 @@ impl Reader {
                         parser: Parser::Hve(parser),
                     })
                 }
+                "dat" | "edb" => {
+                    let parser = match EsedbParser::load(file) {
+                        Ok(parser) => parser,
+                        Err(e) => {
+                            if skip_errors {
+                                cs_eyellowln!(
+                                    "[!] failed to load file '{}' - {}\n",
+                                    file.display(),
+                                    e
+                                );
+                                return Ok(Self {
+                                    parser: Parser::Unknown,
+                                });
+                            } else {
+                                anyhow::bail!(e);
+                            }
+                        }
+                    };
+                    Ok(Self {
+                        parser: Parser::Esedb(parser),
+                    })
+                }
                 _ => {
                     if load_unknown {
                         if let Ok(parser) = EvtxParser::load(file) {
                             return Ok(Self {
                                 parser: Parser::Evtx(parser),
                             });
-                        } else if let Ok(parser) = MftParser::load(file) {
+                        } else if let Ok(parser) = MftParser::load(
+                            file,
+                            data_streams_directory.clone(),
+                            decode_data_streams,
+                        ) {
                             return Ok(Self {
                                 parser: Parser::Mft(parser),
                             });
@@ -241,6 +291,14 @@ impl Reader {
                         } else if let Ok(parser) = XmlParser::load(file) {
                             return Ok(Self {
                                 parser: Parser::Xml(parser),
+                            });
+                        } else if let Ok(parser) = HveParser::load(file) {
+                            return Ok(Self {
+                                parser: Parser::Hve(parser),
+                            });
+                        } else if let Ok(parser) = EsedbParser::load(file) {
+                            return Ok(Self {
+                                parser: Parser::Esedb(parser),
                             });
                         }
                         if skip_errors {
@@ -265,12 +323,24 @@ impl Reader {
                 }
             },
             None => {
+                // Edge cases
+                if file.file_name().and_then(|e| e.to_str()) == Some("$MFT") {
+                    if let Ok(parser) =
+                        MftParser::load(file, data_streams_directory.clone(), decode_data_streams)
+                    {
+                        return Ok(Self {
+                            parser: Parser::Mft(parser),
+                        });
+                    }
+                }
                 if load_unknown {
                     if let Ok(parser) = EvtxParser::load(file) {
                         return Ok(Self {
                             parser: Parser::Evtx(parser),
                         });
-                    } else if let Ok(parser) = MftParser::load(file) {
+                    } else if let Ok(parser) =
+                        MftParser::load(file, data_streams_directory.clone(), decode_data_streams)
+                    {
                         return Ok(Self {
                             parser: Parser::Mft(parser),
                         });
@@ -285,6 +355,10 @@ impl Reader {
                     } else if let Ok(parser) = HveParser::load(file) {
                         return Ok(Self {
                             parser: Parser::Hve(parser),
+                        });
+                    } else if let Ok(parser) = EsedbParser::load(file) {
+                        return Ok(Self {
+                            parser: Parser::Esedb(parser),
                         });
                     }
                     // NOTE: We don't support the JSONL parser as it is too generic, maybe we are
@@ -327,6 +401,18 @@ impl Reader {
                 as Box<dyn Iterator<Item = crate::Result<Document>> + Send + Sync + 'a>,
             Parser::Xml(parser) => Box::new(parser.parse().map(|r| r.map(Document::Xml)))
                 as Box<dyn Iterator<Item = crate::Result<Document>> + Send + Sync + 'a>,
+            Parser::Esedb(parser) => Box::new(
+                parser
+                    .parse()
+                    .map(|r| {
+                        r.and_then(|v| {
+                            serde_json::to_value(v)
+                                .with_context(|| "unexpected JSON serialization error")
+                        })
+                    })
+                    .map(|r| r.map(Document::Esedb)),
+            )
+                as Box<dyn Iterator<Item = crate::Result<Document>> + Send + Sync + 'a>,
             Parser::Unknown => Box::new(Unknown)
                 as Box<dyn Iterator<Item = crate::Result<Document>> + Send + Sync + 'a>,
         };
@@ -341,6 +427,7 @@ impl Reader {
             Parser::Jsonl(_) => Kind::Jsonl,
             Parser::Mft(_) => Kind::Mft,
             Parser::Xml(_) => Kind::Xml,
+            Parser::Esedb(_) => Kind::Esedb,
             Parser::Unknown => Kind::Unknown,
         }
     }
@@ -396,6 +483,10 @@ pub fn get_files(
                     files.push(path.to_path_buf());
                 }
             }
+            // Edge cases
+            if e.contains("$MFT") && path.file_name().and_then(|e| e.to_str()) == Some("$MFT") {
+                files.push(path.to_path_buf());
+            }
         } else {
             files.push(path.to_path_buf());
         }
@@ -405,4 +496,9 @@ pub fn get_files(
         anyhow::bail!("Specified event log path is invalid - {}", path.display());
     }
     Ok(files)
+}
+
+pub fn win32_ts_to_datetime(ts_win32: u64) -> crate::Result<DateTime<Utc>> {
+    let ts_unix = (ts_win32 / 10_000) as i64 - 11644473600000;
+    DateTime::from_timestamp_millis(ts_unix).ok_or(anyhow!("Timestamp out of range!"))
 }

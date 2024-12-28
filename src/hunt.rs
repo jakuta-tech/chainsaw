@@ -11,7 +11,7 @@ use chrono_tz::Tz;
 // https://github.com/rust-lang/rust/issues/74465
 use once_cell::sync::OnceCell;
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHasher};
 use serde::{
     ser::{SerializeStruct, Serializer},
     Deserialize, Serialize,
@@ -64,7 +64,6 @@ pub struct Mapping {
     pub extensions: Option<Extensions>,
     pub groups: Vec<Group>,
     pub kind: FileKind,
-    pub name: String,
     pub rules: RuleKind,
 }
 
@@ -88,7 +87,7 @@ pub struct Document<'a> {
     pub data: Vec<u8>,
 }
 
-impl<'a> Serialize for Document<'a> {
+impl Serialize for Document<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -151,6 +150,7 @@ impl HunterBuilder {
 
     pub fn build(self) -> crate::Result<Hunter> {
         let mut hunts = vec![];
+        cs_trace!("[*] Loading rules...");
         let mut rules = match self.rules {
             Some(mut rules) => {
                 rules.sort_by(|x, y| x.name().cmp(y.name()));
@@ -180,6 +180,7 @@ impl HunterBuilder {
             None => BTreeMap::new(),
         };
         if let Some(mut mappings) = self.mappings {
+            cs_trace!("[*] Loading mappings...");
             mappings.sort();
             for mapping in mappings {
                 let mut file = match fs::File::open(mapping) {
@@ -248,6 +249,7 @@ impl HunterBuilder {
                         FileKind::Jsonl => FileKind::Json,
                         FileKind::Mft => FileKind::Mft,
                         FileKind::Xml => FileKind::Xml,
+                        FileKind::Esedb => FileKind::Esedb,
                         FileKind::Unknown => unreachable!(),
                     };
                     hunts.push(Hunt {
@@ -276,6 +278,7 @@ impl HunterBuilder {
 
         let mut fields = vec![];
         if preprocess {
+            cs_trace!("[*] Preprocessing...");
             let mut keys = HashSet::new();
             for hunt in &hunts {
                 keys.insert(hunt.timestamp.clone());
@@ -437,19 +440,60 @@ impl HunterBuilder {
                 .collect();
         }
 
+        let mut from = None;
+        let mut to = None;
+        if let Some(timestamp) = self.from {
+            if let Some(timezone) = self.timezone {
+                let local = match timezone.from_local_datetime(&timestamp).single() {
+                    Some(l) => l,
+                    None => {
+                        anyhow::bail!("failed to localise timestamp");
+                    }
+                };
+                from = Some(local.with_timezone(&Utc));
+            } else if local {
+                from = Some(match Utc.from_local_datetime(&timestamp).single() {
+                    Some(l) => l,
+                    None => {
+                        anyhow::bail!("failed to localise timestamp");
+                    }
+                });
+            } else {
+                from = Some(Utc.from_utc_datetime(&timestamp));
+            }
+        }
+        if let Some(timestamp) = self.to {
+            if let Some(timezone) = self.timezone {
+                let local = match timezone.from_local_datetime(&timestamp).single() {
+                    Some(l) => l,
+                    None => {
+                        anyhow::bail!("failed to localise timestamp");
+                    }
+                };
+                to = Some(local.with_timezone(&Utc));
+            } else if local {
+                to = Some(match Utc.from_local_datetime(&timestamp).single() {
+                    Some(l) => l,
+                    None => {
+                        anyhow::bail!("failed to localise timestamp");
+                    }
+                });
+            } else {
+                to = Some(Utc.from_utc_datetime(&timestamp));
+            }
+        }
+
         Ok(Hunter {
             inner: HunterInner {
                 hunts,
                 fields,
                 rules,
 
-                from: self.from.map(|d| DateTime::from_utc(d, Utc)),
+                from,
                 load_unknown,
-                local,
                 preprocess,
                 skip_errors,
-                timezone: self.timezone,
-                to: self.to.map(|d| DateTime::from_utc(d, Utc)),
+                to,
             },
         })
     }
@@ -538,10 +582,8 @@ impl Mapper {
             }
         }
         let kind = if full {
-            let mut map = FxHashMap::with_capacity_and_hasher(
-                fields.len(),
-                BuildHasherDefault::<FxHasher>::default(),
-            );
+            cs_trace!("[*] Using mapper in full mode");
+            let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), FxBuildHasher);
             for field in &fields {
                 map.insert(
                     field.from.clone(),
@@ -554,15 +596,14 @@ impl Mapper {
             }
             MapperKind::Full(map)
         } else if fast {
-            let mut map = FxHashMap::with_capacity_and_hasher(
-                fields.len(),
-                BuildHasherDefault::<FxHasher>::default(),
-            );
+            cs_trace!("[*] Using mapper in fast mode");
+            let mut map = FxHashMap::with_capacity_and_hasher(fields.len(), FxBuildHasher);
             for field in &fields {
                 map.insert(field.from.clone(), field.to.clone());
             }
             MapperKind::Fast(map)
         } else {
+            cs_trace!("[*] Using mapper in bypass mode");
             MapperKind::None
         };
         Self { fields, kind }
@@ -589,7 +630,7 @@ pub struct Mapped<'a> {
     document: &'a dyn TauDocument,
     mapper: &'a Mapper,
 }
-impl<'a> TauDocument for Mapped<'a> {
+impl TauDocument for Mapped<'_> {
     fn find(&self, key: &str) -> Option<Tau<'_>> {
         match &self.mapper.kind {
             MapperKind::None => self.document.find(key),
@@ -614,6 +655,21 @@ impl<'a> TauDocument for Mapped<'a> {
                                             Ok(j) => Box::new(j) as Box<dyn TauDocument>,
                                             Err(_) => continue,
                                         },
+                                        Format::Kv {
+                                            ref delimiter,
+                                            ref separator,
+                                            trim,
+                                        } => {
+                                            let mut map = FxHashMap::default();
+                                            for item in s.split(delimiter) {
+                                                let cleaned = if trim { item.trim() } else { item };
+                                                if let Some((k, v)) = cleaned.split_once(separator)
+                                                {
+                                                    map.insert(k.to_owned(), v.to_owned());
+                                                }
+                                            }
+                                            Box::new(map) as Box<dyn TauDocument>
+                                        }
                                     },
                                     _ => continue,
                                 };
@@ -660,10 +716,11 @@ struct Cache<'a> {
     cache: Option<Vec<Option<Tau<'a>>>>,
     mapped: &'a Mapped<'a>,
 }
-impl<'a> TauDocument for Cache<'a> {
+impl TauDocument for Cache<'_> {
     #[inline(always)]
     fn find(&self, key: &str) -> Option<Tau<'_>> {
         if let Some(cache) = &self.cache {
+            cs_trace!("[*] Using cache for key lookup - {}", key);
             let index = key.bytes().fold(0, |acc, x| acc + (x as usize));
             cache[index].clone()
         } else {
@@ -697,11 +754,9 @@ pub struct HunterInner {
     rules: BTreeMap<Uuid, Rule>,
 
     load_unknown: bool,
-    local: bool,
     preprocess: bool,
     from: Option<DateTime<Utc>>,
     skip_errors: bool,
-    timezone: Option<Tz>,
     to: Option<DateTime<Utc>>,
 }
 
@@ -718,8 +773,15 @@ impl Hunter {
         &'a self,
         file: &'a Path,
         cache: &Option<std::fs::File>,
-    ) -> crate::Result<Vec<Detections>> {
-        let mut reader = Reader::load(file, self.inner.load_unknown, self.inner.skip_errors)?;
+    ) -> crate::Result<Vec<Detections<'a>>> {
+        let mut reader = Reader::load(
+            file,
+            self.inner.load_unknown,
+            self.inner.skip_errors,
+            true,
+            None,
+        )?;
+
         let kind = reader.kind();
         #[allow(clippy::type_complexity)]
         let aggregates: Mutex<
@@ -738,7 +800,7 @@ impl Hunter {
                     Err(e) => {
                         if self.inner.skip_errors {
                             cs_eyellowln!(
-                                "[!] failed to parse document '{}' - {}\n",
+                                "[!] failed to parse document '{}' - {} - use --skip-errors to continue...\n",
                                 file.display(),
                                 e
                             );
@@ -748,11 +810,34 @@ impl Hunter {
                     }
                 };
                 let (kind, value): (FileKind, Value) = match document {
-                    File::Evtx(evtx) => (FileKind::Evtx, evtx.data.into()),
-                    File::Hve(hve) => (FileKind::Hve, hve.into()),
-                    File::Json(json) => (FileKind::Json, json.into()),
-                    File::Mft(mft) => (FileKind::Mft, mft.into()),
-                    File::Xml(xml) => (FileKind::Xml, xml.into()),
+                    File::Evtx(evtx) => {
+                        cs_trace!(
+                            "[*] Hunting through document {} - {:?}",
+                            document_id,
+                            evtx.data
+                        );
+                        (FileKind::Evtx, evtx.data.into())
+                    }
+                    File::Hve(hve) => {
+                        cs_trace!("[*] Hunting through document {} - {:?}", document_id, hve);
+                        (FileKind::Hve, hve.into())
+                    }
+                    File::Json(json) => {
+                        cs_trace!("[*] Hunting through document {} - {:?}", document_id, json);
+                        (FileKind::Json, json.into())
+                    }
+                    File::Mft(mft) => {
+                        cs_trace!("[*] Hunting through document {} - {:?}", document_id, mft);
+                        (FileKind::Mft, mft.into())
+                    }
+                    File::Xml(xml) => {
+                        cs_trace!("[*] Hunting through document {} - {:?}", document_id, xml);
+                        (FileKind::Xml, xml.into())
+                    }
+                    File::Esedb(esedb) => {
+                        cs_trace!("[*] Hunting through document {} - {:?}", document_id, esedb);
+                        (FileKind::Esedb, esedb.into())
+                    }
                 };
                 let mut hits = smallvec::smallvec![];
                 for hunt in &self.inner.hunts {
@@ -874,7 +959,7 @@ impl Hunter {
                                         let aggregates = aggregates
                                             .entry((hunt.id, *rid))
                                             .or_insert((aggregate, FxHashMap::default()));
-                                        let docs = aggregates.1.entry(id).or_insert(vec![]);
+                                        let docs = aggregates.1.entry(id).or_default();
                                         docs.push(document_id);
                                     } else {
                                         hits.push(Hit {
@@ -920,7 +1005,7 @@ impl Hunter {
                                     let aggregates = aggregates
                                         .entry((hunt.id, hunt.id))
                                         .or_insert((aggregate, FxHashMap::default()));
-                                    let docs = aggregates.1.entry(id).or_insert(vec![]);
+                                    let docs = aggregates.1.entry(id).or_default();
                                     docs.push(document_id);
                                 } else {
                                     hits.push(Hit {
@@ -933,6 +1018,7 @@ impl Hunter {
                         }
                     }
                 }
+                cs_trace!("[*] Hunted through document {}", document_id);
                 if !hits.is_empty() {
                     if let Some(mut cache) = cache.as_ref() {
                         let mut offset = offset.lock().expect("could not lock offset");
@@ -1038,35 +1124,7 @@ impl Hunter {
 
     fn skip(&self, timestamp: NaiveDateTime) -> crate::Result<bool> {
         if self.inner.from.is_some() || self.inner.to.is_some() {
-            // TODO: Not sure if this is correct...
-            let localised = if let Some(timezone) = self.inner.timezone {
-                let local = match timezone.from_local_datetime(&timestamp).single() {
-                    Some(l) => l,
-                    None => {
-                        if self.inner.skip_errors {
-                            cs_eyellowln!("failed to localise timestamp");
-                            return Ok(true);
-                        } else {
-                            anyhow::bail!("failed to localise timestamp");
-                        }
-                    }
-                };
-                local.with_timezone(&Utc)
-            } else if self.inner.local {
-                match Utc.from_local_datetime(&timestamp).single() {
-                    Some(l) => l,
-                    None => {
-                        if self.inner.skip_errors {
-                            cs_eyellowln!("failed to localise timestamp");
-                            return Ok(true);
-                        } else {
-                            anyhow::bail!("failed to localise timestamp");
-                        }
-                    }
-                }
-            } else {
-                DateTime::<Utc>::from_utc(timestamp, Utc)
-            };
+            let localised = Utc.from_utc_datetime(&timestamp);
             // Check if event is older than start date marker
             if let Some(sd) = self.inner.from {
                 if localised <= sd {
